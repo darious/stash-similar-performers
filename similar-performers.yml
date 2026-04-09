@@ -3,8 +3,7 @@ description: Recommends similar performers based on physical look and scene type
 version: 0.1.0
 
 exec:
-  - python3
-  - compute.py
+  - ./similar-performers-compute
 interface: raw
 
 tasks:
