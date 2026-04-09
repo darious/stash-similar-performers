@@ -10,11 +10,32 @@ import json
 import math
 import sqlite3
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 PORT = 9666
 DB_PATH = None  # resolved from stash config at startup
+
+# ---------------------------------------------------------------------------
+# Simple TTL cache  { (performer_id, mode): (timestamp, results) }
+# ---------------------------------------------------------------------------
+_cache = {}
+CACHE_TTL = 300  # seconds
+
+
+def cache_get(performer_id, mode):
+    key = (performer_id, mode)
+    if key in _cache:
+        ts, results = _cache[key]
+        if time.time() - ts < CACHE_TTL:
+            return results
+        del _cache[key]
+    return None
+
+
+def cache_set(performer_id, mode, results):
+    _cache[(performer_id, mode)] = (time.time(), results)
 
 
 def get_db():
@@ -244,15 +265,29 @@ class Handler(BaseHTTPRequestHandler):
             mode  = params.get('mode',  ['looks'])[0]
             limit = int(params.get('limit', [10])[0])
 
-            if mode == 'looks':
-                results = similar_by_looks(performer_id, limit)
-            elif mode == 'scenes':
-                results = similar_by_scenes(performer_id, limit)
-            else:
+            if mode not in ('looks', 'scenes'):
                 self.send_json({'error': 'mode must be looks or scenes'}, 400)
                 return
 
-            self.send_json({'performer_id': performer_id, 'mode': mode, 'results': results})
+            cached = cache_get(performer_id, mode)
+            if cached is not None:
+                self.send_json({'performer_id': performer_id, 'mode': mode,
+                                'cached': True, 'results': cached})
+                return
+
+            if mode == 'looks':
+                results = similar_by_looks(performer_id, limit)
+            else:
+                results = similar_by_scenes(performer_id, limit)
+
+            cache_set(performer_id, mode, results)
+            self.send_json({'performer_id': performer_id, 'mode': mode,
+                            'cached': False, 'results': results})
+            return
+
+        if parsed.path == '/cache/clear':
+            _cache.clear()
+            self.send_json({'status': 'cache cleared'})
             return
 
         self.send_json({'error': 'not found'}, 404)
