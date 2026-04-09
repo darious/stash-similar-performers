@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build compute binary
+        run: |
+          cd compute
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o ../similar-performers-compute .
+
+      - name: Create plugin zip
+        run: |
+          zip -r similar-performers.zip \
+            similar-performers.yml \
+            similar-performers-compute \
+            ui/ \
+            data/
+
+      - name: Compute SHA256
+        run: sha256sum similar-performers.zip | awk '{print $1}' > similar-performers.zip.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA256=$(cat similar-performers.zip.sha256)
+          gh release create "${{ github.ref_name }}" \
+            similar-performers.zip \
+            similar-performers.zip.sha256 \
+            --title "${{ github.ref_name }}" \
+            --notes "## Installation
+
+          Install via Stash → Settings → Plugins → Available Plugins, or manually:
+
+          1. Download \`similar-performers.zip\` and extract into your Stash plugins directory
+          2. Refresh Plugins in Stash
+          3. Run **Compute Similarities** from Settings → Tasks
+
+          ## SHA256
+          \`\`\`
+          ${SHA256}
+          \`\`\`"
