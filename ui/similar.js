@@ -157,11 +157,11 @@
   // useSimilarByScenes — two-phase true Jaccard
   //
   // Phase 1: get target's scene tags → pick distinctive ones (5–60% frequency)
-  //          → find scenes with those tags → top 50 candidates by co-occurrence
+  //          → find performers who independently appear in scenes with those tags
+  //          → top 50 candidates by weighted tag-scene count
   //
-  // Phase 2: for each of the 50 candidates, fetch their full scene tag set
-  //          (in parallel, Apollo caches each individually)
-  //          → compute true Jaccard vs target tag set
+  // Phase 2: for each candidate fetch their full scene tag set (parallel, Apollo
+  //          caches each individually) → compute true Jaccard vs target tag set
   // ---------------------------------------------------------------------------
 
   function useSimilarByScenes(target) {
@@ -177,19 +177,18 @@
 
       async function run() {
         try {
-          // ── Phase 1 ──────────────────────────────────────────────────────
-          if (!cancelled) setStatus('Fetching scenes\u2026');
+          // ── Phase 1a: build target's tag set ─────────────────────────────
+          if (!cancelled) setStatus('Fetching scene tags\u2026');
 
           const res1 = await client.query({
             query: Q_TARGET_SCENES,
             variables: { id: String(target.id) },
             fetchPolicy: 'cache-first',
           });
-          const targetScenes  = res1.data.findScenes.scenes;
-          const totalScenes   = targetScenes.length;
+          const targetScenes = res1.data.findScenes.scenes;
+          const totalScenes  = targetScenes.length;
           if (!totalScenes) { setResults([]); return; }
 
-          // Build target's full tag set + per-tag frequency
           const targetTagSet = new Set();
           const tagCounts    = {};
           for (const scene of targetScenes) {
@@ -199,8 +198,8 @@
             }
           }
 
-          // Distinctive tags: appear in 5–60% of target's scenes
-          // Avoids generic tags (blowjob, doggy etc.) that appear everywhere
+          // Distinctive tags: appear in 5–60% of target's scenes.
+          // Skips universal tags (blowjob, doggy etc.) that add no signal.
           const minFreq = Math.max(2, totalScenes * 0.05);
           const maxFreq = totalScenes * 0.60;
           const distinctiveTags = Object.entries(tagCounts)
@@ -211,28 +210,31 @@
 
           if (!distinctiveTags.length) { setResults([]); return; }
 
-          // Find all scenes containing any of those distinctive tags
-          // Use Q_TARGET_SCENES structure but for tags — reuse cached Apollo response
-          // We need scenes → performers, so we scan targetScenes for co-performers
-          // AND look at scenes-by-tag query for a broader candidate pool.
-          //
-          // Candidate pool: performers who appear alongside target in their scenes
-          // + performers in scenes tagged with distinctive tags.
-          const targetId = String(target.id);
-          const hitCounts    = {};
+          // ── Phase 1b: find performers who appear in scenes with those tags ─
+          // These are performers who independently do similar content —
+          // NOT co-performers, NOT who has the most scenes overall.
+          if (!cancelled) setStatus('Finding similar performers\u2026');
+
+          const res2 = await client.query({
+            query: Q_SCENES_BY_TAGS,
+            variables: { tag_ids: distinctiveTags },
+            fetchPolicy: 'cache-first',
+          });
+
+          const targetId     = String(target.id);
+          const hitScenes    = {};   // { performerId: Set<sceneId> }
           const performerMap = {};
 
-          // Co-performers from target's own scenes (strong signal)
-          for (const scene of targetScenes) {
+          for (const scene of res2.data.findScenes.scenes) {
             for (const p of scene.performers) {
               if (p.id === targetId) continue;
-              hitCounts[p.id]    = (hitCounts[p.id] || 0) + 2; // weight co-scenes higher
+              if (!hitScenes[p.id]) hitScenes[p.id] = new Set();
+              hitScenes[p.id].add(scene.id);
               performerMap[p.id] = p;
             }
           }
 
-          // Also scan allPerformers cache if available (from looks hook)
-          // to fill in image_path for candidates not in target's scenes
+          // Fill image_path from allPerformers cache if looks hook ran first
           const allPerformers = _cache.allPerformers || [];
           for (const p of allPerformers) {
             if (!performerMap[p.id]) performerMap[p.id] = p;
@@ -240,18 +242,18 @@
 
           if (cancelled) return;
 
-          // Top 50 candidates by co-occurrence signal
-          const topCandidates = Object.entries(hitCounts)
-            .sort((a, b) => b[1] - a[1])
+          // Top 50 by unique matching scenes (not raw appearances, so one scene
+          // with 3 of target's tags counts once not 3×)
+          const topCandidates = Object.entries(hitScenes)
+            .sort((a, b) => b[1].size - a[1].size)
             .slice(0, 50)
             .map(([id]) => id);
 
           if (!topCandidates.length) { setResults([]); return; }
 
-          // ── Phase 2 ──────────────────────────────────────────────────────
-          if (!cancelled) setStatus(`Computing similarity for ${topCandidates.length} candidates\u2026`);
+          // ── Phase 2: fetch each candidate's full tag set in parallel ──────
+          if (!cancelled) setStatus(`Scoring ${topCandidates.length} candidates\u2026`);
 
-          // Fetch each candidate's tag set in parallel; Apollo caches individually
           const tagSetResults = await Promise.all(
             topCandidates.map(id =>
               client.query({
