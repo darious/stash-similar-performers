@@ -3,14 +3,14 @@
 
   const { React } = PluginApi;
   const { useState, useEffect, useRef } = React;
+  const { gql, useApolloClient } = PluginApi.libraries.Apollo;
 
   // ---------------------------------------------------------------------------
-  // GraphQL queries
+  // GraphQL query strings
   // ---------------------------------------------------------------------------
 
-  // Fetch all female performers with physical attributes for look scoring
-  const QUERY_ALL_PERFORMERS = `
-    query SimilarPerformersLooks($page: Int!) {
+  const Q_ALL_PERFORMERS = gql`
+    query SimilarLooks($page: Int!) {
       findPerformers(
         filter: { per_page: 500, page: $page }
         performer_filter: { gender: { value: FEMALE, modifier: EQUALS } }
@@ -31,24 +31,32 @@
     }
   `;
 
-  // Fetch scene tags for a specific performer
-  const QUERY_PERFORMER_SCENE_TAGS = `
-    query SimilarPerformerSceneTags($performer_id: ID!) {
+  const Q_PERFORMER_SCENES = gql`
+    query SimilarSceneTags($id: ID!) {
       findScenes(
-        scene_filter: { performers: { value: [$performer_id], modifier: INCLUDES_ALL } }
+        scene_filter: { performers: { value: [$id], modifier: INCLUDES_ALL } }
         filter: { per_page: -1 }
       ) {
         scenes {
           tags { id }
+          performers { id name image_path }
         }
       }
     }
   `;
 
-  async function gqlQuery(query, variables) {
-    const res = await PluginApi.GQL.client.query({ query: PluginApi.GQL.gql(query), variables });
-    return res.data;
-  }
+  const Q_SCENES_BY_TAGS = gql`
+    query SimilarByTags($tag_ids: [ID!]!) {
+      findScenes(
+        scene_filter: { tags: { value: $tag_ids, modifier: INCLUDES } }
+        filter: { per_page: -1 }
+      ) {
+        scenes {
+          performers { id name image_path }
+        }
+      }
+    }
+  `;
 
   // ---------------------------------------------------------------------------
   // Scoring helpers
@@ -77,20 +85,15 @@
     'Blonde|Auburn':   0.5, 'Auburn|Blonde':   0.5,
   };
 
-  function hairScore(a, b) {
-    if (!a || !b) return 0;
-    if (a === b) return 1;
-    return HAIR_PROXIMITY[`${a}|${b}`] || 0;
-  }
-
   function lookScore(target, candidate) {
-    if (candidate.ethnicity !== target.ethnicity) return 0;
-
+    if (!candidate.ethnicity || candidate.ethnicity !== target.ethnicity) return 0;
     const tm = parseMeasurements(target.measurements);
     const cm = parseMeasurements(candidate.measurements);
-
+    const hairSim = candidate.hair_color === target.hair_color
+      ? 1
+      : (HAIR_PROXIMITY[`${candidate.hair_color}|${target.hair_color}`] || 0);
     return (
-      0.18 * hairScore(candidate.hair_color, target.hair_color) +
+      0.18 * hairSim +
       0.10 * (candidate.eye_color === target.eye_color ? 1 : 0) +
       0.10 * (candidate.fake_tits  === target.fake_tits  ? 1 : 0) +
       0.18 * gaussian(candidate.height_cm, target.height_cm, 6) +
@@ -100,105 +103,153 @@
     );
   }
 
-  function jaccardScore(setA, setB) {
-    if (!setA.size || !setB.size) return 0;
-    let shared = 0;
-    for (const id of setA) { if (setB.has(id)) shared++; }
-    return shared / (setA.size + setB.size - shared);
-  }
-
   // ---------------------------------------------------------------------------
-  // Data fetching with simple session cache
+  // Session-level cache
   // ---------------------------------------------------------------------------
 
   const _cache = {};
 
-  async function getAllPerformers() {
-    if (_cache.allPerformers) return _cache.allPerformers;
-
-    let page = 1, all = [], total = null;
-    do {
-      const data = await gqlQuery(QUERY_ALL_PERFORMERS, { page });
-      const { count, performers } = data.findPerformers;
-      total = count;
-      all = all.concat(performers);
-      page++;
-    } while (all.length < total);
-
-    _cache.allPerformers = all;
-    return all;
-  }
-
-  async function getPerformerSceneTags(performerId) {
-    const key = `tags_${performerId}`;
-    if (_cache[key]) return _cache[key];
-
-    const data = await gqlQuery(QUERY_PERFORMER_SCENE_TAGS, { performer_id: String(performerId) });
-    const tagSet = new Set();
-    for (const scene of data.findScenes.scenes) {
-      for (const tag of scene.tags) tagSet.add(tag.id);
-    }
-    _cache[key] = tagSet;
-    return tagSet;
-  }
-
   // ---------------------------------------------------------------------------
-  // Top N by look score (pure client-side, no extra queries needed)
+  // useSimilarByLooks — fetches all performers (paginated) and scores them
   // ---------------------------------------------------------------------------
 
-  async function getSimilarByLooks(target, limit = 10) {
-    const all = await getAllPerformers();
-    return all
-      .filter(p => p.id !== target.id && p.measurements)
-      .map(p => ({ ...p, score: lookScore(target, p) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
-  }
+  function useSimilarByLooks(target) {
+    const client = useApolloClient();
+    const [results, setResults] = useState(null);
+    const [error, setError] = useState(null);
 
-  // ---------------------------------------------------------------------------
-  // Top N by scene tag Jaccard — fetches tags for top candidates only
-  // ---------------------------------------------------------------------------
+    useEffect(() => {
+      if (!target) return;
+      const cacheKey = `looks_${target.id}`;
+      if (_cache[cacheKey]) { setResults(_cache[cacheKey]); return; }
 
-  async function getSimilarByScenes(target, limit = 10) {
-    const targetTags = await getPerformerSceneTags(target.id);
-    if (!targetTags.size) return [];
+      let cancelled = false;
 
-    const all = await getAllPerformers();
+      async function run() {
+        try {
+          let page = 1, all = [], total = null;
+          do {
+            const res = await client.query({ query: Q_ALL_PERFORMERS, variables: { page } });
+            const { count, performers } = res.data.findPerformers;
+            total = count;
+            all = all.concat(performers);
+            page++;
+          } while (all.length < total);
 
-    // Fetch scene tags for all candidates in parallel (batches of 20)
-    const candidates = all.filter(p => p.id !== target.id);
-    const BATCH = 20;
-    const tagSets = {};
+          const scored = all
+            .filter(p => p.id !== String(target.id) && p.measurements)
+            .map(p => ({ ...p, score: lookScore(target, p) }))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 10);
 
-    for (let i = 0; i < candidates.length; i += BATCH) {
-      const batch = candidates.slice(i, i + BATCH);
-      const results = await Promise.all(
-        batch.map(p => getPerformerSceneTags(p.id).then(tags => ({ id: p.id, tags })))
-      );
-      for (const r of results) tagSets[r.id] = r.tags;
-    }
+          _cache[cacheKey] = scored;
+          if (!cancelled) setResults(scored);
+        } catch (e) {
+          if (!cancelled) setError(e.message);
+        }
+      }
+      run();
+      return () => { cancelled = true; };
+    }, [target && target.id]);
 
-    return candidates
-      .map(p => ({ ...p, score: jaccardScore(targetTags, tagSets[p.id] || new Set()) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+    return { results, error };
   }
 
   // ---------------------------------------------------------------------------
-  // PerformerThumb component
+  // useSimilarByScenes
+  // Step 1: get target's scene tags → find top 20 tags
+  // Step 2: find scenes with those tags → count performer co-occurrences
+  // ---------------------------------------------------------------------------
+
+  function useSimilarByScenes(target) {
+    const client = useApolloClient();
+    const [results, setResults] = useState(null);
+    const [error, setError] = useState(null);
+
+    useEffect(() => {
+      if (!target) return;
+      const cacheKey = `scenes_${target.id}`;
+      if (_cache[cacheKey]) { setResults(_cache[cacheKey]); return; }
+
+      let cancelled = false;
+
+      async function run() {
+        try {
+          // Step 1: get target performer's scene tags
+          const res1 = await client.query({
+            query: Q_PERFORMER_SCENES,
+            variables: { id: String(target.id) },
+          });
+          const scenes = res1.data.findScenes.scenes;
+
+          const tagCounts = {};
+          for (const scene of scenes) {
+            for (const tag of scene.tags) {
+              tagCounts[tag.id] = (tagCounts[tag.id] || 0) + 1;
+            }
+          }
+
+          const topTagIds = Object.entries(tagCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 20)
+            .map(([id]) => id);
+
+          if (!topTagIds.length) { setResults([]); return; }
+
+          // Step 2: find scenes containing those tags, tally performers
+          const res2 = await client.query({
+            query: Q_SCENES_BY_TAGS,
+            variables: { tag_ids: topTagIds },
+          });
+
+          const targetId = String(target.id);
+          const performerHits = {};
+          const performerInfo = {};
+
+          for (const scene of res2.data.findScenes.scenes) {
+            for (const p of scene.performers) {
+              if (p.id === targetId) continue;
+              performerHits[p.id] = (performerHits[p.id] || 0) + 1;
+              performerInfo[p.id] = p;
+            }
+          }
+
+          const maxHits = Math.max(...Object.values(performerHits), 1);
+          const scored = Object.entries(performerHits)
+            .map(([id, hits]) => ({
+              ...performerInfo[id],
+              score: hits / maxHits,
+            }))
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 10);
+
+          _cache[cacheKey] = scored;
+          if (!cancelled) setResults(scored);
+        } catch (e) {
+          if (!cancelled) setError(e.message);
+        }
+      }
+      run();
+      return () => { cancelled = true; };
+    }, [target && target.id]);
+
+    return { results, error };
+  }
+
+  // ---------------------------------------------------------------------------
+  // PerformerThumb
   // ---------------------------------------------------------------------------
 
   function PerformerThumb({ performer, mode }) {
     const pct = Math.round(performer.score * 100);
     const scoreColor = mode === 'looks' ? '#e8a838' : '#5ba4cf';
-
     return React.createElement('a',
       {
         href: `/performers/${performer.id}`,
         style: {
           display: 'flex', flexDirection: 'column', alignItems: 'center',
           width: '110px', flexShrink: 0, textDecoration: 'none', color: 'inherit',
-        }
+        },
       },
       React.createElement('img', {
         src: performer.image_path,
@@ -214,84 +265,81 @@
           marginTop: '6px', fontSize: '11px', textAlign: 'center',
           lineHeight: '1.3', maxWidth: '100px', overflow: 'hidden',
           display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
-        }
+        },
       }, performer.name),
       React.createElement('span', {
-        style: { marginTop: '3px', fontSize: '10px', fontWeight: 'bold', color: scoreColor }
+        style: { marginTop: '3px', fontSize: '10px', fontWeight: 'bold', color: scoreColor },
       }, `${pct}%`)
     );
   }
 
   // ---------------------------------------------------------------------------
-  // SimilarRow component
+  // SimilarRow
   // ---------------------------------------------------------------------------
 
-  function SimilarRow({ target, mode, label }) {
-    const [results, setResults] = useState(null);
-    const [error,   setError]   = useState(null);
-    const mounted = useRef(true);
+  function SimilarLooksRow({ target }) {
+    const { results, error } = useSimilarByLooks(target);
+    return renderRow('Similar by Look', 'looks', results, error);
+  }
 
-    useEffect(() => {
-      mounted.current = true;
-      setResults(null);
-      setError(null);
+  function SimilarScenesRow({ target }) {
+    const { results, error } = useSimilarByScenes(target);
+    return renderRow('Similar by Scene Type', 'scenes', results, error);
+  }
 
-      const fn = mode === 'looks' ? getSimilarByLooks : getSimilarByScenes;
-      fn(target).then(r => {
-        if (mounted.current) setResults(r);
-      }).catch(e => {
-        if (mounted.current) setError(e.message);
-      });
-
-      return () => { mounted.current = false; };
-    }, [target.id, mode]);
-
-    const placeholder = (text) => React.createElement('p', {
-      style: { fontSize: '12px', color: '#888', padding: '8px 0', margin: 0 }
-    }, text);
-
+  function renderRow(label, mode, results, error) {
     let content;
-    if (error)          content = placeholder(`Error: ${error}`);
-    else if (!results)  content = placeholder('Loading…');
-    else if (!results.length) content = placeholder('No matches found.');
-    else content = React.createElement('div', {
-      style: { display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '6px' }
-    }, ...results.map(r =>
-      React.createElement(PerformerThumb, { key: r.id, performer: r, mode })
-    ));
+    if (error) {
+      content = React.createElement('p', {
+        style: { fontSize: '12px', color: '#888', margin: 0 },
+      }, 'Error: ' + error);
+    } else if (!results) {
+      content = React.createElement('p', {
+        style: { fontSize: '12px', color: '#888', margin: 0 },
+      }, 'Loading\u2026');
+    } else if (!results.length) {
+      content = React.createElement('p', {
+        style: { fontSize: '12px', color: '#888', margin: 0 },
+      }, 'No matches found.');
+    } else {
+      content = React.createElement('div', {
+        style: { display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '6px' },
+      }, results.map(r => React.createElement(PerformerThumb, { key: r.id, performer: r, mode })));
+    }
 
     return React.createElement('div', { style: { marginTop: '16px' } },
       React.createElement('div', {
         style: {
           fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase',
           letterSpacing: '0.06em', color: '#aaa', marginBottom: '10px',
-        }
+        },
       }, label),
       content
     );
   }
 
   // ---------------------------------------------------------------------------
-  // SimilarPerformersPanel — injected below performer details
+  // SimilarPerformersPanel
   // ---------------------------------------------------------------------------
 
   function SimilarPerformersPanel({ performer }) {
     return React.createElement('div', {
-      style: { borderTop: '1px solid #333', marginTop: '20px', paddingTop: '16px' }
+      style: { borderTop: '1px solid #333', marginTop: '20px', paddingTop: '16px' },
     },
       React.createElement('div', {
-        style: { fontSize: '14px', fontWeight: 'bold', marginBottom: '4px' }
+        style: { fontSize: '14px', fontWeight: 'bold', marginBottom: '4px' },
       }, 'Similar Performers'),
-      React.createElement(SimilarRow, { target: performer, mode: 'looks',  label: 'Similar by Look' }),
-      React.createElement(SimilarRow, { target: performer, mode: 'scenes', label: 'Similar by Scene Type' })
+      React.createElement(SimilarLooksRow,  { target: performer }),
+      React.createElement(SimilarScenesRow, { target: performer })
     );
   }
 
   // ---------------------------------------------------------------------------
-  // Patch into performer detail page
+  // Patch into performer detail page using patch.instead
   // ---------------------------------------------------------------------------
 
-  PluginApi.patch.after('PerformerDetailsPanel.DetailGroup', function (props, rendered) {
+  PluginApi.patch.instead('PerformerDetailsPanel.DetailGroup', function (props, _, original) {
+    const rendered = original(props);
     if (!props || !props.performer) return rendered;
     return React.createElement(React.Fragment, null,
       rendered,
