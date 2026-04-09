@@ -1,7 +1,19 @@
 name: Similar Performers
 description: Recommends similar performers based on physical look and scene type
 version: 0.1.0
+id: similar-performers
+
+exec:
+  - python3
+  - compute.py
+interface: raw
+
+tasks:
+  - name: Compute Similarities
+    description: Pre-compute performer similarity scores. Run once (takes ~30s), then re-run when your library changes significantly.
 
 ui:
   javascript:
     - ui/similar.js
+  assets:
+    /data: data
