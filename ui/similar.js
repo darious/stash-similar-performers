@@ -41,7 +41,8 @@
     }
   `;
 
-  // Scenes containing any of the given tags — used to find candidate performers
+  // Scenes containing any of the given tags — used to find candidate performers.
+  // Returns tags too so Phase 1 can score by distinct tag coverage (not scene count).
   const Q_SCENES_BY_TAGS = gql`
     query ScenesByTags($tag_ids: [ID!]!) {
       findScenes(
@@ -50,6 +51,7 @@
       ) {
         scenes {
           id
+          tags { id }
           performers { id name image_path }
         }
       }
@@ -155,6 +157,7 @@
             .sort((a, b) => b.score - a.score)
             .slice(0, 10);
 
+          // Always cache regardless of navigation state
           _cache[cacheKey] = scored;
           if (!cancelled) setResults(scored);
         } catch (e) {
@@ -215,19 +218,23 @@
 
           // Distinctive tags: appear in 5–60% of target's scenes.
           // Skips universal tags (blowjob, doggy etc.) that add no signal.
+          // Use the 15 most characteristic (highest frequency within the band)
+          // to keep Q_SCENES_BY_TAGS response manageable.
           const minFreq = Math.max(2, totalScenes * 0.05);
           const maxFreq = totalScenes * 0.60;
           const distinctiveTags = Object.entries(tagCounts)
             .filter(([, n]) => n >= minFreq && n <= maxFreq)
             .sort((a, b) => b[1] - a[1])
-            .slice(0, 40)
+            .slice(0, 15)
             .map(([id]) => id);
 
           if (!distinctiveTags.length) { setResults([]); return; }
 
+          const distinctiveTagSet = new Set(distinctiveTags);
+
           // ── Phase 1b: find performers who appear in scenes with those tags ─
-          // These are performers who independently do similar content —
-          // NOT co-performers, NOT who has the most scenes overall.
+          // Score by how many DISTINCT distinctive tags appear in their scenes —
+          // not how many scenes they have. This avoids prolific performers dominating.
           if (!cancelled) setStatus('Finding similar performers\u2026');
 
           const res2 = await client.query({
@@ -236,15 +243,20 @@
             fetchPolicy: 'cache-first',
           });
 
-          const targetId     = String(target.id);
-          const hitScenes    = {};   // { performerId: Set<sceneId> }
-          const performerMap = {};
+          const targetId           = String(target.id);
+          const performerTagCoverage = {};  // { performerId: Set<distinctiveTagId> }
+          const performerMap         = {};
 
           for (const scene of res2.data.findScenes.scenes) {
+            // Which of the distinctive tags does this scene have?
+            const sceneDTags = scene.tags
+              .map(t => t.id)
+              .filter(id => distinctiveTagSet.has(id));
+
             for (const p of scene.performers) {
               if (p.id === targetId) continue;
-              if (!hitScenes[p.id]) hitScenes[p.id] = new Set();
-              hitScenes[p.id].add(scene.id);
+              if (!performerTagCoverage[p.id]) performerTagCoverage[p.id] = new Set();
+              for (const tagId of sceneDTags) performerTagCoverage[p.id].add(tagId);
               performerMap[p.id] = p;
             }
           }
@@ -257,11 +269,12 @@
 
           if (cancelled) return;
 
-          // Top 50 by unique matching scenes (not raw appearances, so one scene
-          // with 3 of target's tags counts once not 3×)
-          const topCandidates = Object.entries(hitScenes)
+          // Top 100 candidates ranked by number of distinct distinctive tags covered.
+          // A performer who covers 14/15 of target's characteristic tags ranks above
+          // one with 500 scenes who only covers 5/15.
+          const topCandidates = Object.entries(performerTagCoverage)
             .sort((a, b) => b[1].size - a[1].size)
-            .slice(0, 50)
+            .slice(0, 100)
             .map(([id]) => id);
 
           if (!topCandidates.length) { setResults([]); return; }
@@ -285,8 +298,6 @@
             )
           );
 
-          if (cancelled) return;
-
           // ── True Jaccard ─────────────────────────────────────────────────
           const scored = tagSetResults.map(({ id, tagSet }) => {
             let shared = 0;
@@ -302,6 +313,9 @@
           });
 
           const top10 = scored.sort((a, b) => b.score - a.score).slice(0, 10);
+
+          // Always write cache — even if the component unmounted while loading.
+          // This ensures re-visits are instant regardless of when user navigated away.
           _cache[cacheKey] = top10;
           if (!cancelled) { setResults(top10); setStatus(''); }
 
