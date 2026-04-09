@@ -1,16 +1,6 @@
 name: Similar Performers
 description: Recommends similar performers based on physical look and scene type
 version: 0.1.0
-url: https://github.com/darious/stash-similar-performers
-
-exec:
-  - python3
-  - backend/server.py
-interface: raw
-
-tasks:
-  - name: Start Recommendation Server
-    description: Starts the local HTTP server that computes similarity scores
 
 ui:
   javascript:
