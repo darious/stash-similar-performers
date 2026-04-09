@@ -1,187 +1,298 @@
 (function () {
   'use strict';
 
-  const API_BASE = 'http://127.0.0.1:9666';
-  const LIMIT    = 10;
-
-  const { React, ReactDOM } = PluginApi;
-  const { useState, useEffect } = React;
+  const { React } = PluginApi;
+  const { useState, useEffect, useRef } = React;
 
   // ---------------------------------------------------------------------------
-  // Fetch helpers
+  // GraphQL queries
   // ---------------------------------------------------------------------------
 
-  async function fetchSimilar(performerId, mode) {
-    const res = await fetch(`${API_BASE}/similar?id=${performerId}&mode=${mode}&limit=${LIMIT}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return data.results || [];
+  // Fetch all female performers with physical attributes for look scoring
+  const QUERY_ALL_PERFORMERS = `
+    query SimilarPerformersLooks($page: Int!) {
+      findPerformers(
+        filter: { per_page: 500, page: $page }
+        performer_filter: { gender: { value: FEMALE, modifier: EQUALS } }
+      ) {
+        count
+        performers {
+          id
+          name
+          ethnicity
+          hair_color
+          eye_color
+          height_cm
+          measurements
+          fake_tits
+          image_path
+        }
+      }
+    }
+  `;
+
+  // Fetch scene tags for a specific performer
+  const QUERY_PERFORMER_SCENE_TAGS = `
+    query SimilarPerformerSceneTags($performer_id: ID!) {
+      findScenes(
+        scene_filter: { performers: { value: [$performer_id], modifier: INCLUDES_ALL } }
+        filter: { per_page: -1 }
+      ) {
+        scenes {
+          tags { id }
+        }
+      }
+    }
+  `;
+
+  async function gqlQuery(query, variables) {
+    const res = await PluginApi.GQL.client.query({ query: PluginApi.GQL.gql(query), variables });
+    return res.data;
   }
 
   // ---------------------------------------------------------------------------
-  // PerformerThumb — a small card showing name + score
+  // Scoring helpers
   // ---------------------------------------------------------------------------
 
-  function PerformerThumb({ result, mode }) {
-    const scoreLabel = mode === 'looks' ? 'Look' : 'Scene';
+  function gaussian(a, b, sigma) {
+    if (a == null || b == null) return 0;
+    const d = a - b;
+    return Math.exp(-0.5 * d * d / (sigma * sigma));
+  }
+
+  function parseMeasurements(m) {
+    if (!m) return null;
+    const parts = m.split('-');
+    if (parts.length !== 3) return null;
+    const bust = parseInt(parts[0]);
+    const waist = parseInt(parts[1]);
+    const hip = parseInt(parts[2]);
+    if (isNaN(bust) || isNaN(waist) || isNaN(hip)) return null;
+    return { bust, waist, hip };
+  }
+
+  const HAIR_PROXIMITY = {
+    'Brunette|Auburn': 0.6, 'Auburn|Brunette': 0.6,
+    'Brunette|Black':  0.4, 'Black|Brunette':  0.4,
+    'Blonde|Auburn':   0.5, 'Auburn|Blonde':   0.5,
+  };
+
+  function hairScore(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    return HAIR_PROXIMITY[`${a}|${b}`] || 0;
+  }
+
+  function lookScore(target, candidate) {
+    if (candidate.ethnicity !== target.ethnicity) return 0;
+
+    const tm = parseMeasurements(target.measurements);
+    const cm = parseMeasurements(candidate.measurements);
+
+    return (
+      0.18 * hairScore(candidate.hair_color, target.hair_color) +
+      0.10 * (candidate.eye_color === target.eye_color ? 1 : 0) +
+      0.10 * (candidate.fake_tits  === target.fake_tits  ? 1 : 0) +
+      0.18 * gaussian(candidate.height_cm, target.height_cm, 6) +
+      0.15 * (tm && cm ? gaussian(cm.bust,  tm.bust,  3) : 0) +
+      0.15 * (tm && cm ? gaussian(cm.waist, tm.waist, 3) : 0) +
+      0.14 * (tm && cm ? gaussian(cm.hip,   tm.hip,   3) : 0)
+    );
+  }
+
+  function jaccardScore(setA, setB) {
+    if (!setA.size || !setB.size) return 0;
+    let shared = 0;
+    for (const id of setA) { if (setB.has(id)) shared++; }
+    return shared / (setA.size + setB.size - shared);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Data fetching with simple session cache
+  // ---------------------------------------------------------------------------
+
+  const _cache = {};
+
+  async function getAllPerformers() {
+    if (_cache.allPerformers) return _cache.allPerformers;
+
+    let page = 1, all = [], total = null;
+    do {
+      const data = await gqlQuery(QUERY_ALL_PERFORMERS, { page });
+      const { count, performers } = data.findPerformers;
+      total = count;
+      all = all.concat(performers);
+      page++;
+    } while (all.length < total);
+
+    _cache.allPerformers = all;
+    return all;
+  }
+
+  async function getPerformerSceneTags(performerId) {
+    const key = `tags_${performerId}`;
+    if (_cache[key]) return _cache[key];
+
+    const data = await gqlQuery(QUERY_PERFORMER_SCENE_TAGS, { performer_id: String(performerId) });
+    const tagSet = new Set();
+    for (const scene of data.findScenes.scenes) {
+      for (const tag of scene.tags) tagSet.add(tag.id);
+    }
+    _cache[key] = tagSet;
+    return tagSet;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Top N by look score (pure client-side, no extra queries needed)
+  // ---------------------------------------------------------------------------
+
+  async function getSimilarByLooks(target, limit = 10) {
+    const all = await getAllPerformers();
+    return all
+      .filter(p => p.id !== target.id && p.measurements)
+      .map(p => ({ ...p, score: lookScore(target, p) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Top N by scene tag Jaccard — fetches tags for top candidates only
+  // ---------------------------------------------------------------------------
+
+  async function getSimilarByScenes(target, limit = 10) {
+    const targetTags = await getPerformerSceneTags(target.id);
+    if (!targetTags.size) return [];
+
+    const all = await getAllPerformers();
+
+    // Fetch scene tags for all candidates in parallel (batches of 20)
+    const candidates = all.filter(p => p.id !== target.id);
+    const BATCH = 20;
+    const tagSets = {};
+
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      const batch = candidates.slice(i, i + BATCH);
+      const results = await Promise.all(
+        batch.map(p => getPerformerSceneTags(p.id).then(tags => ({ id: p.id, tags })))
+      );
+      for (const r of results) tagSets[r.id] = r.tags;
+    }
+
+    return candidates
+      .map(p => ({ ...p, score: jaccardScore(targetTags, tagSets[p.id] || new Set()) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+  }
+
+  // ---------------------------------------------------------------------------
+  // PerformerThumb component
+  // ---------------------------------------------------------------------------
+
+  function PerformerThumb({ performer, mode }) {
+    const pct = Math.round(performer.score * 100);
     const scoreColor = mode === 'looks' ? '#e8a838' : '#5ba4cf';
-    const pct        = Math.round(result.score * 100);
-
-    const style = {
-      display:        'flex',
-      flexDirection:  'column',
-      alignItems:     'center',
-      width:          '110px',
-      flexShrink:     0,
-      textDecoration: 'none',
-      color:          'inherit',
-    };
-
-    const imgStyle = {
-      width:        '90px',
-      height:       '120px',
-      objectFit:    'cover',
-      borderRadius: '6px',
-      background:   '#2a2a2a',
-    };
-
-    const nameStyle = {
-      marginTop:  '6px',
-      fontSize:   '11px',
-      textAlign:  'center',
-      lineHeight: '1.3',
-      maxWidth:   '100px',
-      overflow:   'hidden',
-      display:    '-webkit-box',
-      WebkitLineClamp: 2,
-      WebkitBoxOrient: 'vertical',
-    };
-
-    const badgeStyle = {
-      marginTop:    '4px',
-      fontSize:     '10px',
-      fontWeight:   'bold',
-      color:        scoreColor,
-    };
 
     return React.createElement('a',
-      { href: `/performers/${result.id}`, style },
+      {
+        href: `/performers/${performer.id}`,
+        style: {
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          width: '110px', flexShrink: 0, textDecoration: 'none', color: 'inherit',
+        }
+      },
       React.createElement('img', {
-        src:   `/performer/${result.id}/image`,
-        alt:   result.name,
-        style: imgStyle,
-        onError: (e) => { e.target.style.background = '#3a3a3a'; e.target.src = ''; },
+        src: performer.image_path,
+        alt: performer.name,
+        style: {
+          width: '90px', height: '120px', objectFit: 'cover',
+          borderRadius: '6px', background: '#2a2a2a',
+        },
+        onError: (e) => { e.target.style.visibility = 'hidden'; },
       }),
-      React.createElement('span', { style: nameStyle }, result.name),
-      React.createElement('span', { style: badgeStyle }, `${scoreLabel}: ${pct}%`)
+      React.createElement('span', {
+        style: {
+          marginTop: '6px', fontSize: '11px', textAlign: 'center',
+          lineHeight: '1.3', maxWidth: '100px', overflow: 'hidden',
+          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+        }
+      }, performer.name),
+      React.createElement('span', {
+        style: { marginTop: '3px', fontSize: '10px', fontWeight: 'bold', color: scoreColor }
+      }, `${pct}%`)
     );
   }
 
   // ---------------------------------------------------------------------------
-  // SimilarRow — horizontal scrolling row of thumbs
+  // SimilarRow component
   // ---------------------------------------------------------------------------
 
-  function SimilarRow({ performerId, mode, label }) {
+  function SimilarRow({ target, mode, label }) {
     const [results, setResults] = useState(null);
     const [error,   setError]   = useState(null);
+    const mounted = useRef(true);
 
     useEffect(() => {
+      mounted.current = true;
       setResults(null);
       setError(null);
-      fetchSimilar(performerId, mode)
-        .then(setResults)
-        .catch((e) => setError(e.message));
-    }, [performerId, mode]);
 
-    const containerStyle = {
-      marginTop:    '16px',
-      paddingBottom: '8px',
-    };
+      const fn = mode === 'looks' ? getSimilarByLooks : getSimilarByScenes;
+      fn(target).then(r => {
+        if (mounted.current) setResults(r);
+      }).catch(e => {
+        if (mounted.current) setError(e.message);
+      });
 
-    const headingStyle = {
-      fontSize:     '13px',
-      fontWeight:   'bold',
-      textTransform: 'uppercase',
-      letterSpacing: '0.05em',
-      marginBottom: '10px',
-      color:        '#aaa',
-    };
+      return () => { mounted.current = false; };
+    }, [target.id, mode]);
 
-    const rowStyle = {
-      display:   'flex',
-      gap:       '12px',
-      overflowX: 'auto',
-      paddingBottom: '6px',
-    };
-
-    const placeholderStyle = {
-      fontSize: '12px',
-      color:    '#666',
-      padding:  '8px 0',
-    };
+    const placeholder = (text) => React.createElement('p', {
+      style: { fontSize: '12px', color: '#888', padding: '8px 0', margin: 0 }
+    }, text);
 
     let content;
-    if (error) {
-      content = React.createElement('p', { style: placeholderStyle },
-        `Could not load (is the backend running? ${error})`
-      );
-    } else if (results === null) {
-      content = React.createElement('p', { style: placeholderStyle }, 'Loading…');
-    } else if (results.length === 0) {
-      content = React.createElement('p', { style: placeholderStyle }, 'No matches found.');
-    } else {
-      content = React.createElement('div', { style: rowStyle },
-        ...results.map(r =>
-          React.createElement(PerformerThumb, { key: r.id, result: r, mode })
-        )
-      );
-    }
+    if (error)          content = placeholder(`Error: ${error}`);
+    else if (!results)  content = placeholder('Loading…');
+    else if (!results.length) content = placeholder('No matches found.');
+    else content = React.createElement('div', {
+      style: { display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '6px' }
+    }, ...results.map(r =>
+      React.createElement(PerformerThumb, { key: r.id, performer: r, mode })
+    ));
 
-    return React.createElement('div', { style: containerStyle },
-      React.createElement('div', { style: headingStyle }, label),
+    return React.createElement('div', { style: { marginTop: '16px' } },
+      React.createElement('div', {
+        style: {
+          fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase',
+          letterSpacing: '0.06em', color: '#aaa', marginBottom: '10px',
+        }
+      }, label),
       content
     );
   }
 
   // ---------------------------------------------------------------------------
-  // SimilarPerformersPanel — both rows together
+  // SimilarPerformersPanel — injected below performer details
   // ---------------------------------------------------------------------------
 
   function SimilarPerformersPanel({ performer }) {
-    const panelStyle = {
-      borderTop:  '1px solid #333',
-      marginTop:  '20px',
-      paddingTop: '16px',
-    };
-
-    const titleStyle = {
-      fontSize:     '15px',
-      fontWeight:   'bold',
-      marginBottom: '4px',
-    };
-
-    return React.createElement('div', { style: panelStyle },
-      React.createElement('div', { style: titleStyle }, 'Similar Performers'),
-      React.createElement(SimilarRow, {
-        performerId: performer.id,
-        mode:        'looks',
-        label:       'Similar by Look',
-      }),
-      React.createElement(SimilarRow, {
-        performerId: performer.id,
-        mode:        'scenes',
-        label:       'Similar by Scene Type',
-      })
+    return React.createElement('div', {
+      style: { borderTop: '1px solid #333', marginTop: '20px', paddingTop: '16px' }
+    },
+      React.createElement('div', {
+        style: { fontSize: '14px', fontWeight: 'bold', marginBottom: '4px' }
+      }, 'Similar Performers'),
+      React.createElement(SimilarRow, { target: performer, mode: 'looks',  label: 'Similar by Look' }),
+      React.createElement(SimilarRow, { target: performer, mode: 'scenes', label: 'Similar by Scene Type' })
     );
   }
 
   // ---------------------------------------------------------------------------
-  // Patch into the performer detail page
+  // Patch into performer detail page
   // ---------------------------------------------------------------------------
 
   PluginApi.patch.after('PerformerDetailsPanel.DetailGroup', function (props, rendered) {
     if (!props || !props.performer) return rendered;
-
     return React.createElement(React.Fragment, null,
       rendered,
       React.createElement(SimilarPerformersPanel, { performer: props.performer })
