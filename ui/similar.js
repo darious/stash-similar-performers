@@ -4,7 +4,7 @@
   const { React } = PluginApi;
   const { useState, useEffect } = React;
 
-  const DATA_URL = '/plugin/similar-performers/data/similarity.json';
+  const DATA_URL = '/plugin/similar-performers/assets/data/similarity.json';
 
   // ---------------------------------------------------------------------------
   // Load the pre-computed similarity data (once per session)

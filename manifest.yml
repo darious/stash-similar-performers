@@ -1,7 +1,6 @@
 name: Similar Performers
 description: Recommends similar performers based on physical look and scene type
 version: 0.1.0
-id: similar-performers
 
 exec:
   - python3
