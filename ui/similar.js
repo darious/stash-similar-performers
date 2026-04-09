@@ -41,6 +41,21 @@
     }
   `;
 
+  // Scenes containing any of the given tags — used to find candidate performers
+  const Q_SCENES_BY_TAGS = gql`
+    query ScenesByTags($tag_ids: [ID!]!) {
+      findScenes(
+        scene_filter: { tags: { value: $tag_ids, modifier: INCLUDES } }
+        filter: { per_page: -1 }
+      ) {
+        scenes {
+          id
+          performers { id name image_path }
+        }
+      }
+    }
+  `;
+
   // Candidate's scenes: tags only (lighter, for phase-2 Jaccard computation)
   const Q_CANDIDATE_TAGSET = gql`
     query CandidateTagSet($id: ID!) {
