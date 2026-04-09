@@ -26,6 +26,7 @@
           measurements
           fake_tits
           image_path
+          scene_count
         }
       }
     }
@@ -52,6 +53,7 @@
         filter: { per_page: -1 }
       ) {
         scenes {
+          id
           performers { id name image_path }
         }
       }
@@ -157,8 +159,10 @@
 
   // ---------------------------------------------------------------------------
   // useSimilarByScenes
-  // Step 1: get target's scene tags → find top 20 tags
-  // Step 2: find scenes with those tags → count performer co-occurrences
+  // Step 1: get target's scenes → compute distinctive tags (5–60% frequency)
+  // Step 2: find scenes with those tags → score candidates by
+  //         unique matching scenes / log(1 + their total scene count)
+  //         This penalises prolific performers who just appear everywhere.
   // ---------------------------------------------------------------------------
 
   function useSimilarByScenes(target) {
@@ -175,13 +179,16 @@
 
       async function run() {
         try {
-          // Step 1: get target performer's scene tags
+          // Step 1: get target performer's scenes with tags
           const res1 = await client.query({
             query: Q_PERFORMER_SCENES,
             variables: { id: String(target.id) },
           });
           const scenes = res1.data.findScenes.scenes;
+          const totalScenes = scenes.length;
+          if (!totalScenes) { setResults([]); return; }
 
+          // Count how often each tag appears across target's scenes
           const tagCounts = {};
           for (const scene of scenes) {
             for (const tag of scene.tags) {
@@ -189,42 +196,66 @@
             }
           }
 
-          const topTagIds = Object.entries(tagCounts)
+          // Keep tags that appear in 5–60% of target's scenes.
+          // Too common (>60%) = generic (blowjob, doggy style, etc.)
+          // Too rare (<5%)   = noise / one-off scenes
+          const minFreq = Math.max(2, totalScenes * 0.05);
+          const maxFreq = totalScenes * 0.60;
+
+          const distinctiveTags = Object.entries(tagCounts)
+            .filter(([, count]) => count >= minFreq && count <= maxFreq)
             .sort((a, b) => b[1] - a[1])
-            .slice(0, 20)
+            .slice(0, 40)
             .map(([id]) => id);
 
-          if (!topTagIds.length) { setResults([]); return; }
+          if (!distinctiveTags.length) { setResults([]); return; }
 
-          // Step 2: find scenes containing those tags, tally performers
+          // Step 2: find scenes containing those tags
           const res2 = await client.query({
             query: Q_SCENES_BY_TAGS,
-            variables: { tag_ids: topTagIds },
+            variables: { tag_ids: distinctiveTags },
           });
 
           const targetId = String(target.id);
-          const performerHits = {};
-          const performerInfo = {};
+
+          // For each candidate, collect the unique scene IDs they share
+          // (avoid counting the same scene twice if it has multiple matching tags)
+          const candidateScenes = {};  // { performerId: Set<sceneId> }
+          const performerInfo  = {};
 
           for (const scene of res2.data.findScenes.scenes) {
             for (const p of scene.performers) {
               if (p.id === targetId) continue;
-              performerHits[p.id] = (performerHits[p.id] || 0) + 1;
+              if (!candidateScenes[p.id]) candidateScenes[p.id] = new Set();
+              candidateScenes[p.id].add(scene.id);
               performerInfo[p.id] = p;
             }
           }
 
-          const maxHits = Math.max(...Object.values(performerHits), 1);
-          const scored = Object.entries(performerHits)
-            .map(([id, hits]) => ({
-              ...performerInfo[id],
-              score: hits / maxHits,
-            }))
+          // We need each candidate's total scene count for normalisation.
+          // Pull from the already-cached allPerformers list where possible.
+          const allPerformers = _cache.allPerformers || [];
+          const sceneCountMap = {};
+          for (const p of allPerformers) sceneCountMap[p.id] = p.scene_count || 1;
+
+          const scored = Object.entries(candidateScenes)
+            .map(([id, sceneSet]) => {
+              const sharedScenes   = sceneSet.size;
+              const totalCandidate = sceneCountMap[id] || 1;
+              // Normalise: shared scenes as a fraction of candidate's career,
+              // divided by log to dampen the advantage of very prolific performers
+              const score = sharedScenes / Math.log(1 + totalCandidate);
+              return { ...performerInfo[id], score };
+            })
             .sort((a, b) => b.score - a.score)
             .slice(0, 10);
 
-          _cache[cacheKey] = scored;
-          if (!cancelled) setResults(scored);
+          // Normalise scores to 0–1 range
+          const maxScore = scored[0] ? scored[0].score : 1;
+          const normalised = scored.map(p => ({ ...p, score: Math.round((p.score / maxScore) * 100) / 100 }));
+
+          _cache[cacheKey] = normalised;
+          if (!cancelled) setResults(normalised);
         } catch (e) {
           if (!cancelled) setError(e.message);
         }
