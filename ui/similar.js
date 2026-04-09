@@ -2,13 +2,14 @@
   'use strict';
 
   const { React } = PluginApi;
-  const { useState, useEffect, useRef } = React;
+  const { useState, useEffect } = React;
   const { gql, useApolloClient } = PluginApi.libraries.Apollo;
 
   // ---------------------------------------------------------------------------
-  // GraphQL query strings
+  // GraphQL queries
   // ---------------------------------------------------------------------------
 
+  // All female performers with physical attributes + scene count (for looks scoring)
   const Q_ALL_PERFORMERS = gql`
     query SimilarLooks($page: Int!) {
       findPerformers(
@@ -17,28 +18,22 @@
       ) {
         count
         performers {
-          id
-          name
-          ethnicity
-          hair_color
-          eye_color
-          height_cm
-          measurements
-          fake_tits
-          image_path
-          scene_count
+          id name ethnicity hair_color eye_color
+          height_cm measurements fake_tits image_path scene_count
         }
       }
     }
   `;
 
-  const Q_PERFORMER_SCENES = gql`
-    query SimilarSceneTags($id: ID!) {
+  // Target performer's scenes: tags (for building tag set) + performers (for phase-1 candidate discovery)
+  const Q_TARGET_SCENES = gql`
+    query TargetScenes($id: ID!) {
       findScenes(
         scene_filter: { performers: { value: [$id], modifier: INCLUDES_ALL } }
         filter: { per_page: -1 }
       ) {
         scenes {
+          id
           tags { id }
           performers { id name image_path }
         }
@@ -46,19 +41,24 @@
     }
   `;
 
-  const Q_SCENES_BY_TAGS = gql`
-    query SimilarByTags($tag_ids: [ID!]!) {
+  // Candidate's scenes: tags only (lighter, for phase-2 Jaccard computation)
+  const Q_CANDIDATE_TAGSET = gql`
+    query CandidateTagSet($id: ID!) {
       findScenes(
-        scene_filter: { tags: { value: $tag_ids, modifier: INCLUDES } }
+        scene_filter: { performers: { value: [$id], modifier: INCLUDES_ALL } }
         filter: { per_page: -1 }
       ) {
-        scenes {
-          id
-          performers { id name image_path }
-        }
+        scenes { tags { id } }
       }
     }
   `;
+
+  // ---------------------------------------------------------------------------
+  // Session-level JS cache  { key -> results }
+  // Lazy-initialising hooks use this so re-mounts skip the loading state entirely
+  // ---------------------------------------------------------------------------
+
+  const _cache = {};
 
   // ---------------------------------------------------------------------------
   // Scoring helpers
@@ -74,9 +74,7 @@
     if (!m) return null;
     const parts = m.split('-');
     if (parts.length !== 3) return null;
-    const bust = parseInt(parts[0]);
-    const waist = parseInt(parts[1]);
-    const hip = parseInt(parts[2]);
+    const bust = parseInt(parts[0]), waist = parseInt(parts[1]), hip = parseInt(parts[2]);
     if (isNaN(bust) || isNaN(waist) || isNaN(hip)) return null;
     return { bust, waist, hip };
   }
@@ -92,8 +90,7 @@
     const tm = parseMeasurements(target.measurements);
     const cm = parseMeasurements(candidate.measurements);
     const hairSim = candidate.hair_color === target.hair_color
-      ? 1
-      : (HAIR_PROXIMITY[`${candidate.hair_color}|${target.hair_color}`] || 0);
+      ? 1 : (HAIR_PROXIMITY[`${candidate.hair_color}|${target.hair_color}`] || 0);
     return (
       0.18 * hairSim +
       0.10 * (candidate.eye_color === target.eye_color ? 1 : 0) +
@@ -106,37 +103,36 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Session-level cache
-  // ---------------------------------------------------------------------------
-
-  const _cache = {};
-
-  // ---------------------------------------------------------------------------
-  // useSimilarByLooks — fetches all performers (paginated) and scores them
+  // useSimilarByLooks
   // ---------------------------------------------------------------------------
 
   function useSimilarByLooks(target) {
-    const client = useApolloClient();
-    const [results, setResults] = useState(null);
-    const [error, setError] = useState(null);
+    const client    = useApolloClient();
+    const cacheKey  = `looks_${target && target.id}`;
+    // Lazy init: if already cached this session, start with results immediately
+    const [results, setResults] = useState(() => _cache[cacheKey] || null);
+    const [error,   setError]   = useState(null);
 
     useEffect(() => {
-      if (!target) return;
-      const cacheKey = `looks_${target.id}`;
-      if (_cache[cacheKey]) { setResults(_cache[cacheKey]); return; }
-
+      if (!target || _cache[cacheKey]) return;
       let cancelled = false;
 
       async function run() {
         try {
           let page = 1, all = [], total = null;
           do {
-            const res = await client.query({ query: Q_ALL_PERFORMERS, variables: { page } });
+            const res = await client.query({
+              query: Q_ALL_PERFORMERS,
+              variables: { page },
+              fetchPolicy: 'cache-first',
+            });
             const { count, performers } = res.data.findPerformers;
             total = count;
-            all = all.concat(performers);
+            all   = all.concat(performers);
             page++;
           } while (all.length < total);
+
+          _cache.allPerformers = all; // share with scene hook
 
           const scored = all
             .filter(p => p.id !== String(target.id) && p.measurements)
@@ -158,104 +154,140 @@
   }
 
   // ---------------------------------------------------------------------------
-  // useSimilarByScenes
-  // Step 1: get target's scenes → compute distinctive tags (5–60% frequency)
-  // Step 2: find scenes with those tags → score candidates by
-  //         unique matching scenes / log(1 + their total scene count)
-  //         This penalises prolific performers who just appear everywhere.
+  // useSimilarByScenes — two-phase true Jaccard
+  //
+  // Phase 1: get target's scene tags → pick distinctive ones (5–60% frequency)
+  //          → find scenes with those tags → top 50 candidates by co-occurrence
+  //
+  // Phase 2: for each of the 50 candidates, fetch their full scene tag set
+  //          (in parallel, Apollo caches each individually)
+  //          → compute true Jaccard vs target tag set
   // ---------------------------------------------------------------------------
 
   function useSimilarByScenes(target) {
-    const client = useApolloClient();
-    const [results, setResults] = useState(null);
-    const [error, setError] = useState(null);
+    const client   = useApolloClient();
+    const cacheKey = `scenes_${target && target.id}`;
+    const [results, setResults] = useState(() => _cache[cacheKey] || null);
+    const [error,   setError]   = useState(null);
+    const [status,  setStatus]  = useState('');
 
     useEffect(() => {
-      if (!target) return;
-      const cacheKey = `scenes_${target.id}`;
-      if (_cache[cacheKey]) { setResults(_cache[cacheKey]); return; }
-
+      if (!target || _cache[cacheKey]) return;
       let cancelled = false;
 
       async function run() {
         try {
-          // Step 1: get target performer's scenes with tags
+          // ── Phase 1 ──────────────────────────────────────────────────────
+          if (!cancelled) setStatus('Fetching scenes\u2026');
+
           const res1 = await client.query({
-            query: Q_PERFORMER_SCENES,
+            query: Q_TARGET_SCENES,
             variables: { id: String(target.id) },
+            fetchPolicy: 'cache-first',
           });
-          const scenes = res1.data.findScenes.scenes;
-          const totalScenes = scenes.length;
+          const targetScenes  = res1.data.findScenes.scenes;
+          const totalScenes   = targetScenes.length;
           if (!totalScenes) { setResults([]); return; }
 
-          // Count how often each tag appears across target's scenes
-          const tagCounts = {};
-          for (const scene of scenes) {
+          // Build target's full tag set + per-tag frequency
+          const targetTagSet = new Set();
+          const tagCounts    = {};
+          for (const scene of targetScenes) {
             for (const tag of scene.tags) {
+              targetTagSet.add(tag.id);
               tagCounts[tag.id] = (tagCounts[tag.id] || 0) + 1;
             }
           }
 
-          // Keep tags that appear in 5–60% of target's scenes.
-          // Too common (>60%) = generic (blowjob, doggy style, etc.)
-          // Too rare (<5%)   = noise / one-off scenes
+          // Distinctive tags: appear in 5–60% of target's scenes
+          // Avoids generic tags (blowjob, doggy etc.) that appear everywhere
           const minFreq = Math.max(2, totalScenes * 0.05);
           const maxFreq = totalScenes * 0.60;
-
           const distinctiveTags = Object.entries(tagCounts)
-            .filter(([, count]) => count >= minFreq && count <= maxFreq)
+            .filter(([, n]) => n >= minFreq && n <= maxFreq)
             .sort((a, b) => b[1] - a[1])
             .slice(0, 40)
             .map(([id]) => id);
 
           if (!distinctiveTags.length) { setResults([]); return; }
 
-          // Step 2: find scenes containing those tags
-          const res2 = await client.query({
-            query: Q_SCENES_BY_TAGS,
-            variables: { tag_ids: distinctiveTags },
-          });
-
+          // Find all scenes containing any of those distinctive tags
+          // Use Q_TARGET_SCENES structure but for tags — reuse cached Apollo response
+          // We need scenes → performers, so we scan targetScenes for co-performers
+          // AND look at scenes-by-tag query for a broader candidate pool.
+          //
+          // Candidate pool: performers who appear alongside target in their scenes
+          // + performers in scenes tagged with distinctive tags.
           const targetId = String(target.id);
+          const hitCounts    = {};
+          const performerMap = {};
 
-          // For each candidate, collect the unique scene IDs they share
-          // (avoid counting the same scene twice if it has multiple matching tags)
-          const candidateScenes = {};  // { performerId: Set<sceneId> }
-          const performerInfo  = {};
-
-          for (const scene of res2.data.findScenes.scenes) {
+          // Co-performers from target's own scenes (strong signal)
+          for (const scene of targetScenes) {
             for (const p of scene.performers) {
               if (p.id === targetId) continue;
-              if (!candidateScenes[p.id]) candidateScenes[p.id] = new Set();
-              candidateScenes[p.id].add(scene.id);
-              performerInfo[p.id] = p;
+              hitCounts[p.id]    = (hitCounts[p.id] || 0) + 2; // weight co-scenes higher
+              performerMap[p.id] = p;
             }
           }
 
-          // We need each candidate's total scene count for normalisation.
-          // Pull from the already-cached allPerformers list where possible.
+          // Also scan allPerformers cache if available (from looks hook)
+          // to fill in image_path for candidates not in target's scenes
           const allPerformers = _cache.allPerformers || [];
-          const sceneCountMap = {};
-          for (const p of allPerformers) sceneCountMap[p.id] = p.scene_count || 1;
+          for (const p of allPerformers) {
+            if (!performerMap[p.id]) performerMap[p.id] = p;
+          }
 
-          const scored = Object.entries(candidateScenes)
-            .map(([id, sceneSet]) => {
-              const sharedScenes   = sceneSet.size;
-              const totalCandidate = sceneCountMap[id] || 1;
-              // Normalise: shared scenes as a fraction of candidate's career,
-              // divided by log to dampen the advantage of very prolific performers
-              const score = sharedScenes / Math.log(1 + totalCandidate);
-              return { ...performerInfo[id], score };
-            })
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 10);
+          if (cancelled) return;
 
-          // Normalise scores to 0–1 range
-          const maxScore = scored[0] ? scored[0].score : 1;
-          const normalised = scored.map(p => ({ ...p, score: Math.round((p.score / maxScore) * 100) / 100 }));
+          // Top 50 candidates by co-occurrence signal
+          const topCandidates = Object.entries(hitCounts)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 50)
+            .map(([id]) => id);
 
-          _cache[cacheKey] = normalised;
-          if (!cancelled) setResults(normalised);
+          if (!topCandidates.length) { setResults([]); return; }
+
+          // ── Phase 2 ──────────────────────────────────────────────────────
+          if (!cancelled) setStatus(`Computing similarity for ${topCandidates.length} candidates\u2026`);
+
+          // Fetch each candidate's tag set in parallel; Apollo caches individually
+          const tagSetResults = await Promise.all(
+            topCandidates.map(id =>
+              client.query({
+                query: Q_CANDIDATE_TAGSET,
+                variables: { id },
+                fetchPolicy: 'cache-first',
+              }).then(res => {
+                const tagSet = new Set();
+                for (const scene of res.data.findScenes.scenes) {
+                  for (const tag of scene.tags) tagSet.add(tag.id);
+                }
+                return { id, tagSet };
+              })
+            )
+          );
+
+          if (cancelled) return;
+
+          // ── True Jaccard ─────────────────────────────────────────────────
+          const scored = tagSetResults.map(({ id, tagSet }) => {
+            let shared = 0;
+            for (const tagId of targetTagSet) {
+              if (tagSet.has(tagId)) shared++;
+            }
+            const union   = targetTagSet.size + tagSet.size - shared;
+            const jaccard = union > 0 ? shared / union : 0;
+            return {
+              ...(performerMap[id] || { id, name: id, image_path: '' }),
+              score: Math.round(jaccard * 1000) / 1000,
+            };
+          });
+
+          const top10 = scored.sort((a, b) => b.score - a.score).slice(0, 10);
+          _cache[cacheKey] = top10;
+          if (!cancelled) { setResults(top10); setStatus(''); }
+
         } catch (e) {
           if (!cancelled) setError(e.message);
         }
@@ -264,7 +296,7 @@
       return () => { cancelled = true; };
     }, [target && target.id]);
 
-    return { results, error };
+    return { results, error, status };
   }
 
   // ---------------------------------------------------------------------------
@@ -272,7 +304,7 @@
   // ---------------------------------------------------------------------------
 
   function PerformerThumb({ performer, mode }) {
-    const pct = Math.round(performer.score * 100);
+    const pct        = Math.round(performer.score * 100);
     const scoreColor = mode === 'looks' ? '#e8a838' : '#5ba4cf';
     return React.createElement('a',
       {
@@ -293,8 +325,8 @@
       }),
       React.createElement('span', {
         style: {
-          marginTop: '6px', fontSize: '11px', textAlign: 'center',
-          lineHeight: '1.3', maxWidth: '100px', overflow: 'hidden',
+          marginTop: '6px', fontSize: '11px', textAlign: 'center', lineHeight: '1.3',
+          maxWidth: '100px', overflow: 'hidden',
           display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
         },
       }, performer.name),
@@ -305,39 +337,42 @@
   }
 
   // ---------------------------------------------------------------------------
-  // SimilarRow
+  // Row renderers
   // ---------------------------------------------------------------------------
+
+  function small(text) {
+    return React.createElement('p', {
+      style: { fontSize: '12px', color: '#888', margin: 0 },
+    }, text);
+  }
 
   function SimilarLooksRow({ target }) {
     const { results, error } = useSimilarByLooks(target);
-    return renderRow('Similar by Look', 'looks', results, error);
+    const label = 'Similar by Look';
+    if (error)    return rowWrap(label, small('Error: ' + error));
+    if (!results) return rowWrap(label, small('Loading\u2026'));
+    if (!results.length) return rowWrap(label, small('No matches found.'));
+    return rowWrap(label,
+      React.createElement('div', {
+        style: { display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '6px' },
+      }, results.map(r => React.createElement(PerformerThumb, { key: r.id, performer: r, mode: 'looks' })))
+    );
   }
 
   function SimilarScenesRow({ target }) {
-    const { results, error } = useSimilarByScenes(target);
-    return renderRow('Similar by Scene Type', 'scenes', results, error);
+    const { results, error, status } = useSimilarByScenes(target);
+    const label = 'Similar by Scene Type';
+    if (error)    return rowWrap(label, small('Error: ' + error));
+    if (!results) return rowWrap(label, small(status || 'Loading\u2026'));
+    if (!results.length) return rowWrap(label, small('No matches found.'));
+    return rowWrap(label,
+      React.createElement('div', {
+        style: { display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '6px' },
+      }, results.map(r => React.createElement(PerformerThumb, { key: r.id, performer: r, mode: 'scenes' })))
+    );
   }
 
-  function renderRow(label, mode, results, error) {
-    let content;
-    if (error) {
-      content = React.createElement('p', {
-        style: { fontSize: '12px', color: '#888', margin: 0 },
-      }, 'Error: ' + error);
-    } else if (!results) {
-      content = React.createElement('p', {
-        style: { fontSize: '12px', color: '#888', margin: 0 },
-      }, 'Loading\u2026');
-    } else if (!results.length) {
-      content = React.createElement('p', {
-        style: { fontSize: '12px', color: '#888', margin: 0 },
-      }, 'No matches found.');
-    } else {
-      content = React.createElement('div', {
-        style: { display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '6px' },
-      }, results.map(r => React.createElement(PerformerThumb, { key: r.id, performer: r, mode })));
-    }
-
+  function rowWrap(label, content) {
     return React.createElement('div', { style: { marginTop: '16px' } },
       React.createElement('div', {
         style: {
@@ -366,7 +401,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Patch into performer detail page using patch.instead
+  // Patch
   // ---------------------------------------------------------------------------
 
   PluginApi.patch.instead('PerformerDetailsPanel.DetailGroup', function (props, _, original) {
